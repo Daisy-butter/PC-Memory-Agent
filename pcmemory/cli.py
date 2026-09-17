@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .indexer import Indexer, sync_registered
 from .store import Store
+from .watcher import WindowsChangeWatcher
 
 
 def default_db() -> Path:
@@ -26,6 +27,7 @@ def make_parser() -> argparse.ArgumentParser:
     watch = sub.add_parser("watch", help="轮询增量同步（只读源目录）")
     watch.add_argument("root", type=Path)
     watch.add_argument("--interval", type=int, default=10)
+    watch.add_argument("--reconcile-seconds", type=int, default=900, help="低频全量校验间隔；0 表示关闭")
     watch.add_argument("--max-size-mib", type=int, default=25)
     watch.add_argument("--include-hidden", action="store_true")
     for name, help_text in (("search", "全文和路径检索"), ("ask", "基于索引返回任务证据")):
@@ -62,10 +64,21 @@ def main(argv: list[str] | None = None) -> int:
         if args.command in {"index", "sync"}:
             print(json.dumps(Indexer(store, args.max_size_mib, args.include_hidden).sync(args.root), ensure_ascii=False))
         elif args.command == "watch":
-            print(f"正在只读监听：{args.root.resolve()}（Ctrl+C 停止）")
-            while True:
-                print(json.dumps(Indexer(store, args.max_size_mib, args.include_hidden).sync(args.root), ensure_ascii=False))
-                time.sleep(max(args.interval, 1))
+            root = args.root.resolve()
+            indexer = Indexer(store, args.max_size_mib, args.include_hidden)
+            print(json.dumps(indexer.sync(root), ensure_ascii=False))
+            watcher, last_reconcile = WindowsChangeWatcher(root), time.monotonic()
+            print(f"正在原生只读监听：{root}（Ctrl+C 停止）")
+            try:
+                while True:
+                    changes = watcher.read_batch()
+                    time.sleep(0.75)
+                    print(json.dumps(indexer.apply_changes(root, changes), ensure_ascii=False))
+                    if args.reconcile_seconds and time.monotonic() - last_reconcile >= args.reconcile_seconds:
+                        print(json.dumps(indexer.sync(root), ensure_ascii=False))
+                        last_reconcile = time.monotonic()
+            finally:
+                watcher.close()
         elif args.command in {"search", "ask"}:
             if not args.no_sync:
                 sync_result = sync_registered(store)

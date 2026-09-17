@@ -73,6 +73,39 @@ class Indexer:
             raise
 
 
+    def apply_changes(self, root: Path, relative_paths: list[Path]) -> dict[str, int]:
+        """Update only watcher-reported paths; periodic sync remains a safety net."""
+        root = root.resolve()
+        stats = {"seen": 0, "indexed": 0, "unchanged": 0, "skipped": 0, "missing": 0}
+        deleted: list[str] = []
+        for relative in set(relative_paths):
+            path = (root / relative).resolve()
+            try:
+                path.relative_to(root)
+            except ValueError:
+                continue
+            if not path.exists():
+                deleted.append(str(path))
+                continue
+            candidates = (item for item in path.rglob("*") if item.is_file()) if path.is_dir() else (path,)
+            for candidate in candidates:
+                try:
+                    if candidate.is_symlink() or is_hidden_or_ignored(candidate, root, self.include_hidden) or not is_supported(candidate):
+                        stats["skipped"] += 1; continue
+                    info = candidate.stat()
+                    if info.st_size > self.max_bytes:
+                        stats["skipped"] += 1; continue
+                    resolved = str(candidate.resolve()); stats["seen"] += 1
+                    previous = self.store.find_by_path(resolved)
+                    if previous and previous["deleted_at"] is None and previous["modified_ns"] == info.st_mtime_ns and previous["size"] == info.st_size:
+                        stats["unchanged"] += 1; continue
+                    text = extract_text(candidate)
+                    _, changed = self.store.upsert_file(path=resolved, name=candidate.name, extension=candidate.suffix.lower(), size=info.st_size, modified_ns=info.st_mtime_ns, content_hash=sha256_file(candidate), status="indexed" if text is not None else "unreadable", chunks=chunk_text(text or ""), entities=entities_from_text(text or "") + entities_from_path(candidate, root), timestamp=now())
+                    stats["indexed" if changed else "unchanged"] += 1
+                except (OSError, PermissionError):
+                    stats["skipped"] += 1
+        stats["missing"] = self.store.mark_deleted_paths(deleted, now())
+        return stats
 def sync_registered(store: Store) -> dict[str, dict[str, int] | str]:
     """Synchronize every registered root before a task query; source files remain read-only."""
     results: dict[str, dict[str, int] | str] = {}

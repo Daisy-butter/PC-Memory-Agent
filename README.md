@@ -13,6 +13,15 @@
 
 PDF、XLSX、PPTX 和 OCR 是下一阶段的解析器扩展点：MVP 会安全记录它们的元数据，但不会读取其内容。
 
+## 实时文件系统维护
+
+Windows 上的 `watch` 使用 `ReadDirectoryChangesW` 接收新增、修改、删除和重命名事件。它以约 750ms 的防抖窗口仅更新受影响路径；重命名先标记旧路径，再由内容哈希恢复为同一文件的历史路径。为应对网络盘、同步客户端和事件缓冲区溢出，默认每 900 秒执行一次低频全量校验。
+
+```powershell
+python -m pcmemory watch "C:\\Users\\31521\\Documents" --reconcile-seconds 900
+```
+
+监听器不写入源目录；所有状态只写入项目的 `.data` 数据库。
 ## 知识图谱实现
 
 图谱采用本地 SQLite 属性图模型：`File`、`Chunk`、`Entity`、`Fact` 与 `FileRelation`。事实采用 `文件 — 谓词 — 实体` 三元组，并保存抽取器、置信度和观测时间；实体别名对课程代码、邮箱和关键词进行规范化。`ask` 先做直接证据检索，再显示有具体共享实体证据的关联候选。

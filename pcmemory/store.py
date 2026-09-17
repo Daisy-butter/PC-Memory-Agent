@@ -105,6 +105,13 @@ class Store:
             self.conn.commit()
         return len(missing)
 
+    def mark_deleted_paths(self, paths: list[str], timestamp: str) -> int:
+        if not paths:
+            return 0
+        before = self.conn.total_changes
+        self.conn.executemany("UPDATE files SET deleted_at=? WHERE path=? AND deleted_at IS NULL", [(timestamp, path) for path in paths])
+        self.conn.commit()
+        return self.conn.total_changes - before
     def upsert_file(self, *, path: str, name: str, extension: str, size: int, modified_ns: int, content_hash: str, status: str, chunks: list[str], entities: list[tuple[str, str]], timestamp: str) -> tuple[int, bool]:
         existing = self.find_by_path(path)
         if existing and existing["content_hash"] == content_hash and existing["modified_ns"] == modified_ns and existing["size"] == size:
