@@ -1,0 +1,11 @@
+[project]
+name = "pc-memory-agent"
+version = "0.1.0"
+description = "Read-only local file memory and retrieval MVP"
+requires-python = ">=3.10"
+
+[project.scripts]
+pcmemory = "pcmemory.cli:main"
+
+[tool.unittest]
+start-directory = "tests"
