@@ -8,7 +8,8 @@ TEXT_EXTENSIONS = {
     ".go", ".rs", ".rb", ".php", ".sql", ".yaml", ".yml", ".toml", ".ini", ".log", ".sh",
     ".ps1", ".bat", ".css", ".tex",
 }
-STRUCTURED_EXTENSIONS = {".docx"}
+STRUCTURED_EXTENSIONS = {".docx", ".pdf", ".xlsx", ".pptx"}
+OCR_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 DEFAULT_IGNORED_NAMES = {
     ".git", ".svn", ".hg", "node_modules", "__pycache__", ".venv", "venv", "$recycle.bin",
     "appdata", "windows", "program files", "program files (x86)", "system volume information",
@@ -16,7 +17,7 @@ DEFAULT_IGNORED_NAMES = {
 
 
 def is_supported(path: Path) -> bool:
-    return path.suffix.lower() in TEXT_EXTENSIONS | STRUCTURED_EXTENSIONS
+    return path.suffix.lower() in TEXT_EXTENSIONS | STRUCTURED_EXTENSIONS | OCR_EXTENSIONS
 
 
 def is_hidden_or_ignored(path: Path, root: Path, include_hidden: bool) -> bool:
