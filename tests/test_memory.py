@@ -43,5 +43,18 @@ class MemoryTests(unittest.TestCase):
                 store.close()
 
 
+    def test_graph_facts_have_typed_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "course.txt").write_text("CS 101 starts 2026-09-01. Contact tutor@example.com", encoding="utf-8")
+            store = Store(root / "index.sqlite")
+            try:
+                Indexer(store).sync(root)
+                file_id = store.search("CS101")[0]["id"]
+                facts = {(item["predicate"], item["value"], item["asserted_by"]) for item in store.facts_for_file(file_id)}
+                self.assertIn(("HAS_COURSE", "CS101", "rules_v1"), facts)
+                self.assertIn(("MENTIONS_CONTACT", "tutor@example.com", "rules_v1"), facts)
+            finally:
+                store.close()
 if __name__ == "__main__":
     unittest.main()

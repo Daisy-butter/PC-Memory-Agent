@@ -34,6 +34,9 @@ def make_parser() -> argparse.ArgumentParser:
         command.add_argument("--limit", type=int, default=10 if name == "search" else 8)
         command.add_argument("--no-sync", action="store_true", help="不在查询前同步已登记目录")
     sub.add_parser("roots", help="查看已登记、会在查询前自动同步的目录")
+    sub.add_parser("rebuild-graph", help="从现有索引回填图谱事实，不读取源文件")
+    explain = sub.add_parser("explain", help="查看文件的可追溯知识图谱事实")
+    explain.add_argument("file_id", type=int)
     show = sub.add_parser("show", help="显示已索引文件的文本块，不读取或修改源文件")
     show.add_argument("file_id", type=int)
     return parser
@@ -79,6 +82,11 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "roots":
             for root in store.registered_roots():
                 print(json.dumps(dict(root), ensure_ascii=False))
+        elif args.command == "rebuild-graph":
+            print(json.dumps({"facts_backfilled": store.rebuild_facts()}, ensure_ascii=False))
+        elif args.command == "explain":
+            for fact in store.facts_for_file(args.file_id):
+                print(f"{fact['predicate']} -> {fact['kind']}:{fact['value']} (confidence={fact['confidence']:.2f}; {fact['asserted_by']})")
         elif args.command == "show":
             file = store.get_file(args.file_id)
             if not file:

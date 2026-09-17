@@ -13,6 +13,17 @@
 
 PDF、XLSX、PPTX 和 OCR 是下一阶段的解析器扩展点：MVP 会安全记录它们的元数据，但不会读取其内容。
 
+## 知识图谱实现
+
+图谱采用本地 SQLite 属性图模型：`File`、`Chunk`、`Entity`、`Fact` 与 `FileRelation`。事实采用 `文件 — 谓词 — 实体` 三元组，并保存抽取器、置信度和观测时间；实体别名对课程代码、邮箱和关键词进行规范化。`ask` 先做直接证据检索，再显示有具体共享实体证据的关联候选。
+
+对升级前已有的索引运行一次下列命令即可回填事实，无需重新读取源文件：
+
+```powershell
+python -m pcmemory rebuild-graph
+```
+
+用 `python -m pcmemory explain <file_id>` 查看某文件的三元组及其置信度。
 ## 安全边界
 
 - 所有数据库、日志和状态只写入 `.data/`，该目录已被 Git 忽略。

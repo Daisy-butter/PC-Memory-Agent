@@ -39,6 +39,10 @@ CREATE TABLE IF NOT EXISTS file_relations (
 );
 CREATE INDEX IF NOT EXISTS idx_file_relations_source ON file_relations(source_file_id);
 CREATE INDEX IF NOT EXISTS idx_file_relations_target ON file_relations(target_file_id);
+CREATE TABLE IF NOT EXISTS entity_aliases (kind TEXT NOT NULL, alias TEXT NOT NULL, entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE, PRIMARY KEY(kind,alias));
+CREATE TABLE IF NOT EXISTS entity_mentions (file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE, entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE, extractor TEXT NOT NULL, confidence REAL NOT NULL, evidence TEXT NOT NULL, PRIMARY KEY(file_id,entity_id,extractor));
+CREATE TABLE IF NOT EXISTS facts (id INTEGER PRIMARY KEY, subject_file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE, predicate TEXT NOT NULL, object_entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE, confidence REAL NOT NULL, asserted_by TEXT NOT NULL, observed_at TEXT NOT NULL, UNIQUE(subject_file_id,predicate,object_entity_id,asserted_by));
+CREATE INDEX IF NOT EXISTS idx_facts_subject ON facts(subject_file_id);
 """
 
 
@@ -74,6 +78,24 @@ class Store:
     def find_active_by_hash(self, content_hash: str):
         return self.conn.execute("SELECT * FROM files WHERE content_hash=? AND deleted_at IS NULL ORDER BY id DESC LIMIT 1", (content_hash,)).fetchone()
 
+    @staticmethod
+    def _normalize_entity(kind: str, value: str) -> str:
+        value = " ".join(value.strip().split())
+        if kind == "course_code":
+            return value.upper()
+        if kind in {"email", "keyword"}:
+            return value.casefold()
+        return value
+
+    def _resolve_entity(self, kind: str, value: str) -> int:
+        alias = self._normalize_entity(kind, value)
+        row = self.conn.execute("SELECT entity_id FROM entity_aliases WHERE kind=? AND alias=?", (kind, alias)).fetchone()
+        if row:
+            return row["entity_id"]
+        self.conn.execute("INSERT OR IGNORE INTO entities(kind,value) VALUES (?,?)", (kind, alias))
+        entity_id = self.conn.execute("SELECT id FROM entities WHERE kind=? AND value=?", (kind, alias)).fetchone()[0]
+        self.conn.execute("INSERT OR IGNORE INTO entity_aliases(kind,alias,entity_id) VALUES (?,?,?)", (kind, alias, entity_id))
+        return entity_id
     def mark_missing_under(self, root: str, present_paths: set[str], timestamp: str) -> int:
         prefix = root.rstrip("\\/") + "\\%"
         rows = self.conn.execute("SELECT id,path FROM files WHERE deleted_at IS NULL AND path LIKE ?", (prefix,)).fetchall()
@@ -105,13 +127,19 @@ class Store:
         self.conn.execute("DELETE FROM chunk_fts WHERE file_id=?", (file_id,))
         self.conn.execute("DELETE FROM chunks WHERE file_id=?", (file_id,))
         self.conn.execute("DELETE FROM file_entities WHERE file_id=?", (file_id,))
+        self.conn.execute("DELETE FROM entity_mentions WHERE file_id=?", (file_id,))
+        self.conn.execute("DELETE FROM facts WHERE subject_file_id=?", (file_id,))
         for ordinal, content in enumerate(chunks):
             cursor = self.conn.execute("INSERT INTO chunks(file_id,ordinal,content) VALUES (?,?,?)", (file_id, ordinal, content))
             self.conn.execute("INSERT INTO chunk_fts(content,file_id,chunk_id) VALUES (?,?,?)", (content, file_id, cursor.lastrowid))
-        for kind, value in entities:
-            self.conn.execute("INSERT OR IGNORE INTO entities(kind,value) VALUES (?,?)", (kind, value))
-            entity_id = self.conn.execute("SELECT id FROM entities WHERE kind=? AND value=?", (kind, value)).fetchone()[0]
+        confidence = {"course_code": .98, "email": .98, "date": .85, "folder_topic": .80, "keyword": .35}
+        predicate = {"course_code": "HAS_COURSE", "email": "MENTIONS_CONTACT", "date": "OBSERVED_ON", "folder_topic": "IN_FOLDER_TOPIC", "keyword": "MENTIONS"}
+        for kind, value in set(entities):
+            entity_id = self._resolve_entity(kind, value)
             self.conn.execute("INSERT OR REPLACE INTO file_entities(file_id,entity_id,occurrences) VALUES (?,?,1)", (file_id, entity_id))
+            score = confidence.get(kind, .30)
+            self.conn.execute("INSERT OR REPLACE INTO entity_mentions VALUES (?,?,?,?,?)", (file_id, entity_id, "rules_v1", score, value[:240]))
+            self.conn.execute("INSERT OR REPLACE INTO facts(subject_file_id,predicate,object_entity_id,confidence,asserted_by,observed_at) VALUES (?,?,?,?,?,?)", (file_id, predicate.get(kind, "MENTIONS"), entity_id, score, "rules_v1", timestamp))
         self.conn.commit()
         self._rebuild_file_relations(file_id, timestamp)
         return file_id, True
@@ -137,11 +165,35 @@ class Store:
           JOIN entities e ON e.id=r.evidence_entity_id
           WHERE (r.source_file_id IN ({marks}) OR r.target_file_id IN ({marks})) AND f.deleted_at IS NULL AND f.id NOT IN ({marks})
           GROUP BY f.id,r.relation_type,e.value ORDER BY score DESC,f.modified_ns DESC LIMIT ?""", (*file_ids,*file_ids,*file_ids,*file_ids,limit)).fetchall()
+    def rebuild_facts(self) -> int:
+        """Backfill asserted facts from existing file/entity links without reading source files."""
+        predicates = {"course_code": ("HAS_COURSE", .98), "email": ("MENTIONS_CONTACT", .98), "date": ("OBSERVED_ON", .85), "folder_topic": ("IN_FOLDER_TOPIC", .80), "keyword": ("MENTIONS", .35)}
+        rows = self.conn.execute("""SELECT fe.file_id,e.id AS entity_id,e.kind,f.indexed_at
+          FROM file_entities fe JOIN entities e ON e.id=fe.entity_id JOIN files f ON f.id=fe.file_id
+          WHERE f.deleted_at IS NULL""").fetchall()
+        self.conn.execute("DELETE FROM facts")
+        for row in rows:
+            predicate, confidence = predicates.get(row["kind"], ("MENTIONS", .30))
+            self.conn.execute("INSERT OR REPLACE INTO facts(subject_file_id,predicate,object_entity_id,confidence,asserted_by,observed_at) VALUES (?,?,?,?,?,?)", (row["file_id"], predicate, row["entity_id"], confidence, "migration_v1", row["indexed_at"]))
+        self.conn.commit()
+        return len(rows)
+    def facts_for_file(self, file_id: int):
+        return self.conn.execute("""SELECT fa.predicate,e.kind,e.value,fa.confidence,fa.asserted_by,fa.observed_at
+          FROM facts fa JOIN entities e ON e.id=fa.object_entity_id WHERE fa.subject_file_id=?
+          ORDER BY fa.confidence DESC,e.kind,e.value""", (file_id,)).fetchall()
     def search(self, query: str, limit: int = 10):
         terms = [part for part in query.replace('"', ' ').split() if part]
         if not terms:
             return []
         fts_query = " AND ".join(f'"{term}"' for term in terms)
+        canonical_terms = [self._normalize_entity("course_code", term) for term in terms]
+        marks = ",".join("?" for _ in canonical_terms)
+        entity_rows = self.conn.execute(f"""SELECT DISTINCT f.id,f.path,f.name,f.extension,f.modified_ns,NULL AS chunk_id,
+          ('[entity] ' || e.kind || ':' || e.value) AS snippet,-100.0 AS rank
+          FROM entities e JOIN file_entities fe ON fe.entity_id=e.id JOIN files f ON f.id=fe.file_id
+          WHERE e.value IN ({marks}) AND f.deleted_at IS NULL ORDER BY f.modified_ns DESC LIMIT ?""", (*canonical_terms, limit)).fetchall()
+        if entity_rows:
+            return entity_rows
         try:
             rows = self.conn.execute("""SELECT f.id,f.path,f.name,f.extension,f.modified_ns,c.id AS chunk_id,
               snippet(chunk_fts,0,'[',']','...',18) AS snippet,bm25(chunk_fts) AS rank
