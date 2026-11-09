@@ -2,3 +2,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+FileSystem_wrh/
+*.sqlite3
+*.sqlite3-*
+*.safetensors

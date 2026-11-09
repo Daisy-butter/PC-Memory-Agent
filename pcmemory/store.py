@@ -45,6 +45,24 @@ CREATE TABLE IF NOT EXISTS facts (id INTEGER PRIMARY KEY, subject_file_id INTEGE
 CREATE INDEX IF NOT EXISTS idx_facts_subject ON facts(subject_file_id);
 """
 
+PREDICATES = {
+    "course_code": ("HAS_COURSE", 0.98),
+    "email": ("MENTIONS_CONTACT", 0.98),
+    "date": ("OBSERVED_ON", 0.85),
+    "folder_topic": ("IN_FOLDER_TOPIC", 0.80),
+    "project": ("BELONGS_TO_PROJECT", 0.90),
+    "version_family": ("MEMBER_OF_VERSION_FAMILY", 0.88),
+    "modality": ("HAS_MODALITY", 0.99),
+    "keyword": ("MENTIONS", 0.35),
+    "catalog_keyword": ("TAGGED", 0.75),
+    "content_hash": ("HAS_CONTENT_ID", 0.99),
+}
+RELATION_WEIGHTS = {
+    "course_code": ("SAME_COURSE", 0.95),
+    "email": ("SAME_CONTACT", 0.80),
+    "content_hash": ("SAME_CONTENT", 0.99),
+}
+
 
 class Store:
     def __init__(self, db_path: Path):
@@ -83,7 +101,7 @@ class Store:
         value = " ".join(value.strip().split())
         if kind == "course_code":
             return value.upper()
-        if kind in {"email", "keyword"}:
+        if kind in {"email", "keyword", "project", "version_family", "modality", "catalog_keyword", "content_hash"}:
             return value.casefold()
         return value
 
@@ -97,7 +115,8 @@ class Store:
         self.conn.execute("INSERT OR IGNORE INTO entity_aliases(kind,alias,entity_id) VALUES (?,?,?)", (kind, alias, entity_id))
         return entity_id
     def mark_missing_under(self, root: str, present_paths: set[str], timestamp: str) -> int:
-        prefix = root.rstrip("\\/") + "\\%"
+        separator = "\\" if "\\" in root else "/"
+        prefix = root.rstrip("\\/") + separator + "%"
         rows = self.conn.execute("SELECT id,path FROM files WHERE deleted_at IS NULL AND path LIKE ?", (prefix,)).fetchall()
         missing = [row["id"] for row in rows if row["path"] not in present_paths]
         if missing:
@@ -120,7 +139,12 @@ class Store:
                 self.conn.commit()
                 return existing["id"], True
             return existing["id"], False
-        moved = None if existing else (self.find_deleted_by_hash(content_hash) or self.find_active_by_hash(content_hash))
+        moved = None
+        if existing is None:
+            # Same bytes at a path that is already gone is a rename. A copy that still exists stays a second file.
+            candidate = self.find_deleted_by_hash(content_hash) or self.find_active_by_hash(content_hash)
+            if candidate is not None and not Path(candidate["path"]).exists():
+                moved = candidate
         if moved:
             self.conn.execute("INSERT INTO file_history(file_id,previous_path,observed_at) VALUES (?,?,?)", (moved["id"], moved["path"], timestamp))
             self.conn.execute("UPDATE files SET path=?,name=?,extension=?,size=?,modified_ns=?,content_hash=?,indexed_at=?,text_status=?,deleted_at=NULL WHERE id=?", (path, name, extension, size, modified_ns, content_hash, timestamp, status, moved["id"]))
@@ -139,29 +163,45 @@ class Store:
         for ordinal, content in enumerate(chunks):
             cursor = self.conn.execute("INSERT INTO chunks(file_id,ordinal,content) VALUES (?,?,?)", (file_id, ordinal, content))
             self.conn.execute("INSERT INTO chunk_fts(content,file_id,chunk_id) VALUES (?,?,?)", (content, file_id, cursor.lastrowid))
-        confidence = {"course_code": .98, "email": .98, "date": .85, "folder_topic": .80, "keyword": .35}
-        predicate = {"course_code": "HAS_COURSE", "email": "MENTIONS_CONTACT", "date": "OBSERVED_ON", "folder_topic": "IN_FOLDER_TOPIC", "keyword": "MENTIONS"}
         for kind, value in set(entities):
             entity_id = self._resolve_entity(kind, value)
+            predicate, score = PREDICATES.get(kind, ("MENTIONS", 0.30))
             self.conn.execute("INSERT OR REPLACE INTO file_entities(file_id,entity_id,occurrences) VALUES (?,?,1)", (file_id, entity_id))
-            score = confidence.get(kind, .30)
             self.conn.execute("INSERT OR REPLACE INTO entity_mentions VALUES (?,?,?,?,?)", (file_id, entity_id, "rules_v1", score, value[:240]))
-            self.conn.execute("INSERT OR REPLACE INTO facts(subject_file_id,predicate,object_entity_id,confidence,asserted_by,observed_at) VALUES (?,?,?,?,?,?)", (file_id, predicate.get(kind, "MENTIONS"), entity_id, score, "rules_v1", timestamp))
+            self.conn.execute("INSERT OR REPLACE INTO facts(subject_file_id,predicate,object_entity_id,confidence,asserted_by,observed_at) VALUES (?,?,?,?,?,?)", (file_id, predicate, entity_id, score, "rules_v1", timestamp))
         self.conn.commit()
         self._rebuild_file_relations(file_id, timestamp)
         return file_id, True
 
     def _rebuild_file_relations(self, file_id: int, timestamp: str) -> None:
         self.conn.execute("DELETE FROM file_relations WHERE source_file_id=? OR target_file_id=?", (file_id, file_id))
-        weights = {"course_code": ("SAME_COURSE", 0.95), "folder_topic": ("SHARED_FOLDER_TOPIC", 0.75), "date": ("SAME_DATE", 0.45), "email": ("SAME_CONTACT", 0.8), "keyword": ("SHARED_KEYWORD", 0.25)}
         rows = self.conn.execute("""SELECT other.file_id AS target_id,e.id AS entity_id,e.kind
           FROM file_entities mine JOIN file_entities other ON mine.entity_id=other.entity_id
           JOIN entities e ON e.id=mine.entity_id JOIN files target ON target.id=other.file_id
           WHERE mine.file_id=? AND other.file_id<>? AND target.deleted_at IS NULL""", (file_id, file_id)).fetchall()
         for row in rows:
-            relation_type, score = weights.get(row["kind"], ("SHARED_ENTITY", 0.2))
+            spec = RELATION_WEIGHTS.get(row["kind"])
+            if not spec:
+                continue
+            relation_type, score = spec
             self.conn.execute("INSERT OR REPLACE INTO file_relations VALUES (?,?,?,?,?,?)", (file_id, row["target_id"], relation_type, row["entity_id"], score, timestamp))
+        self._link_newer_versions(file_id, timestamp)
         self.conn.commit()
+
+    def _link_newer_versions(self, file_id: int, timestamp: str) -> None:
+        row = self.conn.execute("SELECT id, path, modified_ns FROM files WHERE id=?", (file_id,)).fetchone()
+        family = self.conn.execute("""SELECT e.id FROM entities e JOIN file_entities fe ON fe.entity_id=e.id
+          WHERE fe.file_id=? AND e.kind='version_family'""", (file_id,)).fetchone()
+        if not row or not family:
+            return
+        parent = str(Path(row["path"]).parent)
+        others = self.conn.execute("""SELECT f.id, f.path, f.modified_ns FROM files f JOIN file_entities fe ON fe.file_id=f.id
+          WHERE fe.entity_id=? AND f.deleted_at IS NULL""", (family["id"],)).fetchall()
+        for other in others:
+            if other["id"] == file_id or str(Path(other["path"]).parent) != parent:
+                continue
+            newer, older = (file_id, other["id"]) if (row["modified_ns"], row["id"]) >= (other["modified_ns"], other["id"]) else (other["id"], file_id)
+            self.conn.execute("INSERT OR REPLACE INTO file_relations VALUES (?,?,?,?,?,?)", (newer, older, "NEWER_VERSION", family["id"], 0.93, timestamp))
 
     def related_files(self, file_ids: list[int], limit: int = 10):
         if not file_ids:
@@ -174,13 +214,12 @@ class Store:
           GROUP BY f.id,r.relation_type,e.value ORDER BY score DESC,f.modified_ns DESC LIMIT ?""", (*file_ids,*file_ids,*file_ids,*file_ids,limit)).fetchall()
     def rebuild_facts(self) -> int:
         """Backfill asserted facts from existing file/entity links without reading source files."""
-        predicates = {"course_code": ("HAS_COURSE", .98), "email": ("MENTIONS_CONTACT", .98), "date": ("OBSERVED_ON", .85), "folder_topic": ("IN_FOLDER_TOPIC", .80), "keyword": ("MENTIONS", .35)}
         rows = self.conn.execute("""SELECT fe.file_id,e.id AS entity_id,e.kind,f.indexed_at
           FROM file_entities fe JOIN entities e ON e.id=fe.entity_id JOIN files f ON f.id=fe.file_id
           WHERE f.deleted_at IS NULL""").fetchall()
         self.conn.execute("DELETE FROM facts")
         for row in rows:
-            predicate, confidence = predicates.get(row["kind"], ("MENTIONS", .30))
+            predicate, confidence = PREDICATES.get(row["kind"], ("MENTIONS", 0.30))
             self.conn.execute("INSERT OR REPLACE INTO facts(subject_file_id,predicate,object_entity_id,confidence,asserted_by,observed_at) VALUES (?,?,?,?,?,?)", (row["file_id"], predicate, row["entity_id"], confidence, "migration_v1", row["indexed_at"]))
         self.conn.commit()
         return len(rows)
@@ -227,3 +266,70 @@ class Store:
 
     def get_chunks(self, file_id: int):
         return self.conn.execute("SELECT ordinal,content FROM chunks WHERE file_id=? ORDER BY ordinal", (file_id,)).fetchall()
+
+    def project_counts(self):
+        return self.conn.execute("""SELECT e.value, COUNT(*) AS files FROM entities e
+          JOIN file_entities fe ON fe.entity_id=e.id JOIN files f ON f.id=fe.file_id
+          WHERE e.kind='project' AND f.deleted_at IS NULL GROUP BY e.id ORDER BY files DESC, e.value""").fetchall()
+
+    def modality_counts(self):
+        return self.conn.execute("""SELECT e.value, COUNT(*) AS files FROM entities e
+          JOIN file_entities fe ON fe.entity_id=e.id JOIN files f ON f.id=fe.file_id
+          WHERE e.kind='modality' AND f.deleted_at IS NULL GROUP BY e.id ORDER BY files DESC, e.value""").fetchall()
+
+    def project_files(self, name: str, limit: int = 20):
+        alias = self._normalize_entity("project", name)
+        return self.conn.execute("""SELECT f.id, f.path, f.name, f.modified_ns FROM files f
+          JOIN file_entities fe ON fe.file_id=f.id JOIN entities e ON e.id=fe.entity_id
+          WHERE e.kind='project' AND e.value=? AND f.deleted_at IS NULL
+          ORDER BY f.modified_ns DESC LIMIT ?""", (alias, limit)).fetchall()
+
+    def version_group(self, file_id: int):
+        family = self.conn.execute("""SELECT e.id FROM entities e JOIN file_entities fe ON fe.entity_id=e.id
+          WHERE fe.file_id=? AND e.kind='version_family'""", (file_id,)).fetchone()
+        origin = self.conn.execute("SELECT path FROM files WHERE id=?", (file_id,)).fetchone()
+        if not family or not origin:
+            return []
+        parent = str(Path(origin["path"]).parent)
+        rows = self.conn.execute("""SELECT f.id, f.path, f.name, f.modified_ns FROM files f
+          JOIN file_entities fe ON fe.file_id=f.id
+          WHERE fe.entity_id=? AND f.deleted_at IS NULL ORDER BY f.modified_ns DESC, f.id DESC""", (family["id"],)).fetchall()
+        return [row for row in rows if str(Path(row["path"]).parent) == parent]
+
+    def version_groups(self, limit: int = 8):
+        rows = self.conn.execute("""SELECT e.value AS family, f.id, f.path, f.name, f.modified_ns
+          FROM entities e JOIN file_entities fe ON fe.entity_id=e.id JOIN files f ON f.id=fe.file_id
+          WHERE e.kind='version_family' AND f.deleted_at IS NULL""").fetchall()
+        grouped: dict[tuple[str, str], list] = {}
+        for row in rows:
+            grouped.setdefault((row["family"], str(Path(row["path"]).parent)), []).append(row)
+        groups = []
+        for (family, parent), files in grouped.items():
+            if len(files) < 2:
+                continue
+            ordered = sorted(files, key=lambda item: (item["modified_ns"], item["id"]), reverse=True)
+            groups.append({"family": family, "parent": parent, "files": ordered, "newest_ns": ordered[0]["modified_ns"]})
+        groups.sort(key=lambda item: item["newest_ns"], reverse=True)
+        return groups[:limit]
+
+    def content_timelines(self, file_ids: list[int], limit: int = 4):
+        """Identical bytes in more than one place, newest observed copy first."""
+        if not file_ids:
+            return []
+        marks = ",".join("?" for _ in file_ids)
+        hash_rows = self.conn.execute(f"""SELECT DISTINCT e.id FROM entities e JOIN file_entities fe ON fe.entity_id=e.id
+          WHERE fe.file_id IN ({marks}) AND e.kind='content_hash'""", file_ids).fetchall()
+        groups = []
+        for row in hash_rows:
+            files = self.conn.execute("""SELECT f.id, f.path, f.name, f.modified_ns FROM files f
+              JOIN file_entities fe ON fe.file_id=f.id
+              WHERE fe.entity_id=? AND f.deleted_at IS NULL
+              ORDER BY f.modified_ns DESC, f.id DESC""", (row["id"],)).fetchall()
+            if len(files) > 1:
+                groups.append(files)
+        groups.sort(key=lambda items: (items[0]["modified_ns"], items[0]["id"]), reverse=True)
+        return groups[:limit]
+
+    def recent_files(self, limit: int = 8):
+        return self.conn.execute("""SELECT id, path, name, extension, modified_ns, NULL AS chunk_id, '' AS snippet, 0 AS rank
+          FROM files WHERE deleted_at IS NULL ORDER BY modified_ns DESC LIMIT ?""", (limit,)).fetchall()

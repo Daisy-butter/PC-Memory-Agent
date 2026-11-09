@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -42,6 +43,38 @@ class MemoryTests(unittest.TestCase):
             finally:
                 store.close()
 
+
+    def test_linux_watch_tracks_create_rename_and_delete(self):
+        if os.name == "nt":
+            self.skipTest("inotify only exists on Linux")
+        from pcmemory.watcher import LinuxChangeWatcher
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original = root / "笔记.txt"
+            original.write_text("旧会议纪要", encoding="utf-8")
+            store = Store(root / "index.sqlite")
+            indexer = Indexer(store)
+            watcher = LinuxChangeWatcher(root)
+            try:
+                indexer.sync(root)
+                created = root / "补充.txt"
+                created.write_text("新会议纪要", encoding="utf-8")
+                paths, overflow = watcher.read_batch(2)
+                self.assertFalse(overflow)
+                self.assertTrue(any(path.name == "补充.txt" for path in paths))
+                indexer.apply_changes(root, paths)
+                self.assertEqual(len(store.search("新会议纪要")), 1)
+                renamed = root / "补充_final.txt"
+                created.rename(renamed)
+                indexer.apply_changes(root, watcher.read_batch(2)[0])
+                self.assertEqual(store.search("新会议纪要")[0]["name"], "补充_final.txt")
+                renamed.unlink()
+                indexer.apply_changes(root, watcher.read_batch(2)[0])
+                self.assertEqual(store.search("新会议纪要"), [])
+                self.assertEqual(store.search("旧会议纪要")[0]["name"], "笔记.txt")
+            finally:
+                watcher.close()
+                store.close()
 
     def test_graph_facts_have_typed_provenance(self):
         with tempfile.TemporaryDirectory() as directory:

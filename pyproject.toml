@@ -1,11 +1,12 @@
 [project]
 name = "pc-memory-agent"
-version = "0.1.0"
-description = "Read-only local file memory and retrieval MVP"
+version = "0.2.0"
+description = "Local file memory graph for an agent, with Qwen3-8B on vLLM"
 requires-python = ">=3.10"
 
 [project.optional-dependencies]
 documents = ["pypdf>=5.0"]
+media = ["faster-whisper>=1.1.0", "Pillow>=10"]
 
 [project.scripts]
 pcmemory = "pcmemory.cli:main"

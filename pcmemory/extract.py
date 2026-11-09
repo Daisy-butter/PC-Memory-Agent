@@ -1,14 +1,25 @@
 from __future__ import annotations
 
-import os
+import gzip
+import json
 import re
-import shutil
-import subprocess
 import zipfile
 from pathlib import Path
 from xml.etree import ElementTree
 
-from .policy import OCR_EXTENSIONS, TEXT_EXTENSIONS
+from .media import observe_audio, observe_image, observe_video
+from .policy import (
+    AUDIO_EXTENSIONS,
+    DESIGN_EXTENSIONS,
+    DRAWING_EXTENSIONS,
+    NOTEBOOK_EXTENSIONS,
+    OCR_EXTENSIONS,
+    SENSITIVE_EXTENSIONS,
+    TEXT_EXTENSIONS,
+    VECTOR_EXTENSIONS,
+    VIDEO_EXTENSIONS,
+    modality_of,
+)
 
 MAX_TEXT_CHARS = 2_000_000
 STOP_WORDS = {"this", "that", "with", "from", "have", "will", "the", "and", "for", "文件", "项目", "相关", "可以", "进行", "课程", "资料", "作业"}
@@ -58,32 +69,169 @@ def _pptx_text(path: Path) -> str | None:
         return None
 
 
-def _ocr(path: Path) -> str | None:
-    if os.getenv("PCM_ENABLE_OCR") != "1" or not shutil.which("tesseract"):
+class Extracted:
+    def __init__(self, text: str | None, modality: str):
+        self.text = text
+        self.modality = modality
+
+
+def _readable_text(raw: bytes) -> str | None:
+    """Decode UTF-8 or GB18030 text. NUL bytes and control-heavy binaries stay out of the graph."""
+    if not raw or b"\x00" in raw[:8192]:
         return None
+    for encoding in ("utf-8-sig", "utf-8"):
+        try:
+            return raw[:MAX_TEXT_CHARS].decode(encoding)
+        except UnicodeDecodeError:
+            pass
     try:
-        result = subprocess.run(["tesseract", str(path), "stdout", "-l", "eng+chi_sim"], capture_output=True, text=True, timeout=90, check=False)
-        return result.stdout[:MAX_TEXT_CHARS] if result.returncode == 0 else None
-    except (OSError, subprocess.TimeoutExpired):
+        text = raw[:MAX_TEXT_CHARS].decode("gb18030")
+    except UnicodeDecodeError:
         return None
+    sample = text[:2000]
+    controls = sum(ord(char) < 32 and char not in "\n\r\t" for char in sample)
+    printable = sum(char.isprintable() or char in "\n\r\t" for char in sample)
+    if controls > 4 or not sample or printable / len(sample) < 0.85:
+        return None
+    return text
+
+
+def _svg_text(path: Path) -> str:
+    raw = path.read_text(encoding="utf-8", errors="replace")[:500_000]
+    pieces = [item.strip() for item in re.findall(r"<(?:text|tspan|title|desc)[^>]*>([^<]+)", raw, flags=re.I)]
+    pieces = [item for item in pieces if item]
+    viewbox = re.search(r'viewBox=["\']([^"\']+)["\']', raw)
+    size = f" viewBox={viewbox.group(1)}" if viewbox else ""
+    body = "\n".join(pieces[:40]) if pieces else "SVG 矢量图，文件内没有可抽取的文字节点。"
+    return f"[image] svg name={path.name}{size}\n{body}"
+
+
+def _notebook_text(path: Path) -> str | None:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    parts: list[str] = []
+    for cell in data.get("cells", []):
+        source = cell.get("source", "")
+        if isinstance(source, list):
+            source = "".join(source)
+        if str(source).strip():
+            parts.append(str(source))
+    return "\n\n".join(parts)[:MAX_TEXT_CHARS] or None
+
+
+def _zip_text(path: Path) -> str:
+    names: list[str] = []
+    total = 0
+    with zipfile.ZipFile(path) as archive:
+        for info in archive.infolist():
+            if info.is_dir():
+                continue
+            total += 1
+            if len(names) < 60:
+                names.append(info.filename)
+    extra = f"\n... 另有 {total - len(names)} 个条目未列出" if total > len(names) else ""
+    body = "\n".join(names) if names else "压缩包里没有文件条目。"
+    return f"[archive] {path.name} entries={total}\n{body}{extra}"
+
+
+def _graffle_text(path: Path) -> str:
+    raw = path.read_bytes()
+    if raw[:2] == b"\x1f\x8b":
+        raw = gzip.decompress(raw)
+    text = raw.decode("utf-8", errors="replace")
+    text = re.sub(r"<data>.*?</data>", "", text, flags=re.S)
+    strings = [item.strip() for item in re.findall(r"<string>([^<]{2,180})</string>", text)]
+    kept = [item for item in strings if item and not re.fullmatch(r"[A-Za-z0-9+/=\s]+", item)]
+    body = "\n".join(dict.fromkeys(kept[:40])) if kept else "OmniGraffle 绘图，已跳过内嵌预览图的二进制。"
+    return f"[drawing] graffle name={path.name}\n{body}"
+
+
+def load_catalog(root: Path) -> dict[str, dict]:
+    path = root / "metadata.json"
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, list):
+        return {}
+    catalog: dict[str, dict] = {}
+    for item in data:
+        if isinstance(item, dict) and item.get("relative_path"):
+            catalog[str(item["relative_path"]).replace("\\", "/")] = item
+    return catalog
+
+
+def catalog_preface(record: dict | None) -> str:
+    if not record:
+        return ""
+    summary = str(record.get("summary") or "").strip()
+    modality = str(record.get("modality") or "").strip()
+    keywords = record.get("keywords") or []
+    if not isinstance(keywords, list):
+        keywords = []
+    words = "、".join(str(item).strip() for item in keywords if str(item).strip())
+    lines = ["[目录摘要]"]
+    if modality:
+        lines.append(f"标注模态: {modality}")
+    if summary:
+        lines.append(summary)
+    if words:
+        lines.append("关键词: " + words)
+    return "\n".join(lines) + "\n"
+
+
+def extract_document(path: Path) -> Extracted:
+    suffix = path.suffix.lower()
+    modality = modality_of(suffix)
+    try:
+        if suffix in SENSITIVE_EXTENSIONS:
+            return Extracted(f"[secret] {path.name} 是证书或密钥材料，只记录路径，不读取内容。", "secret")
+        if suffix == ".svg":
+            return Extracted(_svg_text(path), "image")
+        if suffix in NOTEBOOK_EXTENSIONS:
+            return Extracted(_notebook_text(path), "text")
+        if suffix == ".zip":
+            return Extracted(_zip_text(path), "archive")
+        if suffix in DRAWING_EXTENSIONS:
+            return Extracted(_graffle_text(path), "drawing")
+        if suffix in DESIGN_EXTENSIONS:
+            return Extracted(f"[image] {path.name} 是设计稿二进制，文本模型不能直接读取像素。", "image")
+        if suffix == ".eps":
+            raw = path.read_bytes()[:8000]
+            comments = [line for line in raw.decode("latin-1", errors="replace").splitlines() if line.startswith("%")]
+            body = "\n".join(comments[:30]) or "EPS 图片，没有可读注释。"
+            return Extracted(f"[image] eps name={path.name}\n{body}", "image")
+        if suffix in TEXT_EXTENSIONS or suffix == "":
+            text = _readable_text(path.read_bytes()[: MAX_TEXT_CHARS + 1])
+            if text is not None:
+                return Extracted(text, "text")
+        if suffix == ".docx":
+            with zipfile.ZipFile(path) as archive:
+                return Extracted(_xml_text(archive.read("word/document.xml"), NS_MAIN + "t")[:MAX_TEXT_CHARS], modality)
+        if suffix == ".pdf":
+            return Extracted(_pdf_text(path), modality)
+        if suffix == ".xlsx":
+            return Extracted(_xlsx_text(path), modality)
+        if suffix == ".pptx":
+            return Extracted(_pptx_text(path), modality)
+        if suffix in OCR_EXTENSIONS:
+            return Extracted(observe_image(path), "image")
+        if suffix in AUDIO_EXTENSIONS:
+            return Extracted(observe_audio(path), "audio")
+        if suffix in VIDEO_EXTENSIONS:
+            return Extracted(observe_video(path), "video")
+        if suffix not in VECTOR_EXTENSIONS | AUDIO_EXTENSIONS | VIDEO_EXTENSIONS | OCR_EXTENSIONS:
+            text = _readable_text(path.read_bytes()[: MAX_TEXT_CHARS + 1])
+            if text is not None:
+                return Extracted(text, "text")
+    except (OSError, zipfile.BadZipFile, KeyError, ElementTree.ParseError, json.JSONDecodeError, gzip.BadGzipFile, ValueError):
+        return Extracted(None, modality)
+    return Extracted(None, modality)
 
 
 def extract_text(path: Path) -> str | None:
-    suffix = path.suffix.lower()
-    try:
-        if suffix in TEXT_EXTENSIONS:
-            raw = path.read_bytes()
-            for encoding in ("utf-8", "utf-8-sig", "gb18030", "latin-1"):
-                try: return raw.decode(encoding)[:MAX_TEXT_CHARS]
-                except UnicodeDecodeError: pass
-        if suffix == ".docx":
-            with zipfile.ZipFile(path) as z: return _xml_text(z.read("word/document.xml"), NS_MAIN + "t")[:MAX_TEXT_CHARS]
-        if suffix == ".pdf": return _pdf_text(path)
-        if suffix == ".xlsx": return _xlsx_text(path)
-        if suffix == ".pptx": return _pptx_text(path)
-        if suffix in OCR_EXTENSIONS: return _ocr(path)
-    except (OSError, zipfile.BadZipFile, KeyError, ElementTree.ParseError): pass
-    return None
+    return extract_document(path).text
 
 
 def chunk_text(text: str, size: int = 1200, overlap: int = 160) -> list[str]:

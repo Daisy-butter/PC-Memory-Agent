@@ -1,0 +1,5 @@
+# This host driver is 570.86 (CUDA 12.8). vLLM 0.20+ pulls a CUDA 13 torch and will not start.
+vllm==0.19.0
+faster-whisper>=1.1.0
+pypdf>=5
+Pillow>=10
